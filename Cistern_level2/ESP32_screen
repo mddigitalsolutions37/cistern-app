@@ -1,0 +1,1928 @@
+#define LGFX_USE_V1
+#include <Arduino.h>
+#include <math.h>
+#include <Wire.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <Preferences.h>
+#include <LovyanGFX.hpp>
+#include <lgfx/v1/platforms/esp32s3/Panel_RGB.hpp>
+#include <lgfx/v1/platforms/esp32s3/Bus_RGB.hpp>
+
+// Touch I2C speed is easy to test from one place.
+// If you want to rule out bus timing artifacts, try 100000UL here.
+static constexpr uint32_t TOUCH_I2C_FREQ = 400000UL;
+
+class LGFX : public lgfx::LGFX_Device {
+public:
+  lgfx::v1::Bus_RGB   _bus;
+  lgfx::v1::Panel_RGB _panel;
+  lgfx::Touch_GT911   _touch;
+
+  LGFX() {
+    {
+      auto cfg = _bus.config();
+      cfg.panel = &_panel;
+      cfg.pin_d0  = GPIO_NUM_15;
+      cfg.pin_d1  = GPIO_NUM_7;
+      cfg.pin_d2  = GPIO_NUM_6;
+      cfg.pin_d3  = GPIO_NUM_5;
+      cfg.pin_d4  = GPIO_NUM_4;
+      cfg.pin_d5  = GPIO_NUM_9;
+      cfg.pin_d6  = GPIO_NUM_46;
+      cfg.pin_d7  = GPIO_NUM_3;
+      cfg.pin_d8  = GPIO_NUM_8;
+      cfg.pin_d9  = GPIO_NUM_16;
+      cfg.pin_d10 = GPIO_NUM_1;
+      cfg.pin_d11 = GPIO_NUM_14;
+      cfg.pin_d12 = GPIO_NUM_21;
+      cfg.pin_d13 = GPIO_NUM_47;
+      cfg.pin_d14 = GPIO_NUM_48;
+      cfg.pin_d15 = GPIO_NUM_45;
+      cfg.pin_henable = GPIO_NUM_41;
+      cfg.pin_vsync   = GPIO_NUM_40;
+      cfg.pin_hsync   = GPIO_NUM_39;
+      cfg.pin_pclk    = GPIO_NUM_0;
+      cfg.freq_write = 15000000;
+      cfg.hsync_polarity    = 0;
+      cfg.hsync_front_porch = 40;
+      cfg.hsync_pulse_width = 48;
+      cfg.hsync_back_porch  = 40;
+      cfg.vsync_polarity    = 0;
+      cfg.vsync_front_porch = 1;
+      cfg.vsync_pulse_width = 31;
+      cfg.vsync_back_porch  = 13;
+      cfg.pclk_active_neg = 1;
+      cfg.de_idle_high    = 0;
+      cfg.pclk_idle_high  = 0;
+      _bus.config(cfg);
+    }
+
+    {
+      auto pcfg = _panel.config();
+      pcfg.memory_width  = 800;
+      pcfg.memory_height = 480;
+      pcfg.panel_width   = 800;
+      pcfg.panel_height  = 480;
+      pcfg.offset_x = 0;
+      pcfg.offset_y = 0;
+      _panel.config(pcfg);
+    }
+
+    _panel.setBus(&_bus);
+    setPanel(&_panel);
+  }
+
+  void configureTouch(uint8_t i2cAddr) {
+    auto cfg = _touch.config();
+    cfg.x_min = 0;
+    cfg.x_max = 799;
+    cfg.y_min = 0;
+    cfg.y_max = 479;
+    cfg.pin_int = -1;
+    cfg.bus_shared = false;
+    cfg.offset_rotation = 0;
+    cfg.i2c_port = I2C_NUM_0;
+    cfg.pin_sda = GPIO_NUM_19;
+    cfg.pin_scl = GPIO_NUM_20;
+    cfg.pin_rst = -1;
+    cfg.freq = TOUCH_I2C_FREQ;
+    cfg.i2c_addr = i2cAddr;
+    _touch.config(cfg);
+    _panel.setTouch(&_touch);
+  }
+};
+
+struct Rect {
+  int x;
+  int y;
+  int w;
+  int h;
+};
+
+LGFX lcd;
+Preferences prefs;
+HardwareSerial HC12Serial(1);
+
+static constexpr int PIN_BACKLIGHT = 2;
+static constexpr int HC12_RX_PIN = 44;
+static constexpr int HC12_TX_PIN = 43;
+static constexpr int TOUCH_SDA_PIN = 19;
+static constexpr int TOUCH_SCL_PIN = 20;
+static constexpr uint8_t GT911_ADDR_PRIMARY = 0x5D;
+static constexpr uint8_t GT911_ADDR_ALT = 0x14;
+
+static constexpr int SCREEN_W = 800;
+static constexpr int SCREEN_H = 480;
+static constexpr int RADIUS = 16;
+
+static constexpr int CISTERN_CAPACITY_DEFAULT = 2974;
+static constexpr float AVG_DAILY_USE_GAL = 105.6f;
+static constexpr unsigned long LINK_TIMEOUT_MS = 15000UL;
+static constexpr unsigned long FOOTER_REFRESH_MS = 1000UL;
+static constexpr unsigned long WIFI_STATUS_REFRESH_MS = 500UL;
+static constexpr unsigned long TOUCH_POLL_INTERVAL_MS = 18UL;
+static constexpr unsigned long TOUCH_DEBOUNCE_MS = 110UL;
+static constexpr unsigned long SERVER_POST_INTERVAL_MS = 15000UL;
+static constexpr uint16_t SERVER_POST_TIMEOUT_MS = 2500;
+static constexpr unsigned long SERVER_COMMAND_POLL_INTERVAL_MS = 2000UL;
+static constexpr unsigned long SERVER_COMMAND_RESULT_TIMEOUT_MS = 7000UL;
+static constexpr int MAX_SCAN_NETWORKS = 8;
+// Enable this once the display-side HC-12 RXD is physically connected
+// to the CrowPanel TX pin defined above.
+static constexpr bool SCREEN_HC12_TX_ENABLED = true;
+
+// Flask bridge configuration.
+// Change SERVER_URL if the computer running your Flask app gets a new LAN IP.
+// This must be your local Wi-Fi/LAN address, not a Tailscale address.
+static const char* SERVER_URL = "http://192.168.1.48:8085/api/device/update";
+static const char* SERVER_COMMAND_URL = "http://192.168.1.48:8085/api/device/command";
+static const char* SERVER_COMMAND_RESULT_URL = "http://192.168.1.48:8085/api/device/command_result";
+static const char* DEVICE_ID = "cistern_001";
+
+static const uint16_t COLOR_BG       = 0x0841;
+static const uint16_t COLOR_PANEL    = 0x10C3;
+static const uint16_t COLOR_PANEL_2  = 0x18E4;
+static const uint16_t COLOR_BORDER   = 0x2966;
+static const uint16_t COLOR_TEXT     = 0xFFFF;
+static const uint16_t COLOR_MUTED    = 0xBDF7;
+static const uint16_t COLOR_SUBTLE   = 0x7BEF;
+static const uint16_t COLOR_BLUE     = 0x3D7D;
+static const uint16_t COLOR_BLUE_DIM = 0x1A74;
+static const uint16_t COLOR_GREEN    = 0x3666;
+static const uint16_t COLOR_AMBER    = 0xFD20;
+static const uint16_t COLOR_RED      = 0xF104;
+
+static constexpr int HEADER_X = 16;
+static constexpr int HEADER_Y = 14;
+static constexpr int HEADER_W = 768;
+static constexpr int HEADER_H = 54;
+static const Rect NAV_BTN_1 = { 456, HEADER_Y + 10, 72, 34 };
+static const Rect NAV_BTN_2 = { 538, HEADER_Y + 10, 72, 34 };
+static const Rect STATUS_PILL = { 620, HEADER_Y + 10, 146, 34 };
+
+static constexpr int LEFT_X = 16;
+static constexpr int LEFT_Y = 84;
+static constexpr int LEFT_W = 484;
+static constexpr int LEFT_H = 248;
+static constexpr int RIGHT_X = 516;
+static constexpr int RIGHT_Y = 84;
+static constexpr int RIGHT_W = 268;
+static constexpr int RIGHT_H = 248;
+static constexpr int TILE_Y = 348;
+static constexpr int TILE_H = 86;
+static constexpr int TILE_GAP = 16;
+static constexpr int TILE_W = 245;
+static constexpr int FOOTER_X = 16;
+static constexpr int FOOTER_Y = 444;
+static constexpr int FOOTER_W = 768;
+static constexpr int FOOTER_H = 22;
+
+enum ScreenPage {
+  PAGE_DASHBOARD = 0,
+  PAGE_SETUP = 1,
+  PAGE_WIFI = 2,
+  PAGE_WIFI_SELECT = 3,
+  PAGE_WIFI_PASSWORD = 4,
+};
+
+ScreenPage currentPage = PAGE_DASHBOARD;
+
+String rxLine = "";
+String lastRaw = "Waiting for data...";
+float levelPct = 0.0f;
+int gallons = 0;
+int adcValue = 0;
+bool calibrated = false;
+bool hasValidPacket = false;
+
+bool touchAvailable = false;
+bool touchPressed = false;
+uint8_t touchAddress = 0;
+uint16_t touchX = 0;
+uint16_t touchY = 0;
+unsigned long lastTouchPollMillis = 0;
+unsigned long lastTouchActionMillis = 0;
+
+String cachedFooterLine = "";
+String cachedHeaderStatus = "";
+String cachedWifiStateLine = "";
+unsigned long lastPacketMillis = 0;
+unsigned long lastFooterRefresh = 0;
+unsigned long lastWifiRefresh = 0;
+unsigned long lastPostMillis = 0;
+unsigned long lastCommandPollMillis = 0;
+bool lastPostSuccess = false;
+int lastPostHttpCode = 0;
+float lastPostedLevelPct = -1000.0f;
+int lastPostedGallons = -1;
+int lastPostedAdc = -1;
+bool lastPostedCalibrated = false;
+bool bridgeCommandPending = false;
+String bridgePendingCommandId = "";
+String bridgePendingCommand = "";
+unsigned long bridgePendingCommandMillis = 0;
+
+float calibTankHeightFt = 9.5f;
+float calibTankFullGal = (float)CISTERN_CAPACITY_DEFAULT;
+float calibBaselinePct = 51.8f;
+String calibBaselineTs = "Not set";
+bool calibForceBaseline = false;
+int calibDownFt = 0;
+int calibDownIn = 0;
+String calibPreviewMessage = "Preview not calculated yet";
+String calibResultMessage = "No action yet";
+String calibCommandResult = "Ready";
+String lastIssuedCommand = "";
+unsigned long setupButtonHighlightUntil = 0;
+
+enum SetupCommandButton {
+  SETUP_BTN_NONE = 0,
+  SETUP_BTN_CAL_EMPTY,
+  SETUP_BTN_CAL_FULL,
+  SETUP_BTN_CLR_CAL,
+  SETUP_BTN_GET_CAL,
+};
+
+SetupCommandButton highlightedSetupButton = SETUP_BTN_NONE;
+
+enum CalibEntryField {
+  CALIB_ENTRY_NONE = 0,
+  CALIB_ENTRY_TANK_HEIGHT,
+  CALIB_ENTRY_TANK_FULL,
+  CALIB_ENTRY_DOWN_FT,
+  CALIB_ENTRY_DOWN_IN,
+};
+
+CalibEntryField activeCalibEntryField = CALIB_ENTRY_NONE;
+String calibEntryBuffer = "";
+
+String savedWifiSsid = "";
+String savedWifiPassword = "";
+String selectedWifiSsid = "";
+String wifiPasswordEntry = "";
+String wifiActionMessage = "Wi-Fi is optional and does not affect local monitoring.";
+bool wifiConnectInProgress = false;
+bool wifiScanInProgress = false;
+bool wifiKeyboardShift = false;
+int scanNetworkCount = 0;
+String scanSsids[MAX_SCAN_NETWORKS];
+int scanRssi[MAX_SCAN_NETWORKS];
+bool scanOpen[MAX_SCAN_NETWORKS];
+String renderedWifiListSignature = "";
+
+static constexpr int KEYBOARD_START_X = 38;
+static constexpr int KEYBOARD_START_Y = 190;
+static constexpr int KEYBOARD_COLS = 10;
+static constexpr int KEYBOARD_ROWS = 4;
+static constexpr int KEY_W = 68;
+static constexpr int KEY_H = 42;
+static constexpr int KEY_GAP = 6;
+static const Rect PASS_BTN_SHIFT   = { 38, 392, 94, 42 };
+static const Rect PASS_BTN_SPACE   = { 142, 392, 146, 42 };
+static const Rect PASS_BTN_BKSP    = { 298, 392, 110, 42 };
+static const Rect PASS_BTN_CLEAR   = { 418, 392, 94, 42 };
+static const Rect PASS_BTN_CONNECT = { 522, 392, 120, 42 };
+static const Rect PASS_BTN_CANCEL  = { 652, 392, 110, 42 };
+
+static const Rect CALIB_MODAL = { 122, 60, 556, 376 };
+static const Rect CALIB_ENTRY_DISPLAY = { 150, 170, 500, 78 };
+static const Rect CALIB_KEY_CANCEL = { 150, 398, 108, 30 };
+static const Rect CALIB_KEY_CLEAR  = { 270, 398, 108, 30 };
+static const Rect CALIB_KEY_BKSP   = { 390, 398, 108, 30 };
+static const Rect CALIB_KEY_APPLY  = { 510, 398, 140, 30 };
+
+void showCurrentPage();
+void drawHeader(const char* pageSubtitle);
+void drawHeaderNavButtons();
+void drawHeaderStatusPill();
+void handleTouchInput();
+void updateDashboardData();
+void updateWifiStateMachine();
+void updateSetupLiveSnapshot();
+void updateSetupFieldArea();
+void updateCalibrationMessages();
+void updateSetupCommandArea();
+void updateWifiStatusArea();
+void updateWifiControlsArea();
+void updateWifiListArea(bool forceRedraw = false);
+void updatePasswordField();
+void updateKeyboardShiftButton();
+void updateWifiKeyboardCharacters();
+void updateCalibEntryDisplay();
+String jsonEscape(const String& value);
+String jsonGetString(const String& json, const String& key);
+bool jsonGetBool(const String& json, const String& key, bool defaultValue = false);
+bool postCisternReading();
+void pollServerForCommand();
+bool postCommandResultToServer(const String& cmdId, const String& cmd, const String& result, bool ok);
+
+bool extractValue(const String& src, const String& key, String& out) {
+  int start = src.indexOf(key);
+  if (start < 0) return false;
+  start += key.length();
+  int end = src.indexOf(';', start);
+  if (end < 0) end = src.length();
+  out = src.substring(start, end);
+  out.trim();
+  return out.length() > 0;
+}
+
+bool parsePacket(const String& packet) {
+  String val;
+  bool gotAnything = false;
+
+  if (extractValue(packet, "LVL:", val)) {
+    levelPct = val.toFloat();
+    gotAnything = true;
+  }
+  if (extractValue(packet, "G:", val)) {
+    gallons = val.toInt();
+    gotAnything = true;
+  }
+  if (extractValue(packet, "ADC:", val)) {
+    adcValue = val.toInt();
+    gotAnything = true;
+  }
+  if (extractValue(packet, "CAL:", val)) {
+    calibrated = (val.toInt() != 0);
+    gotAnything = true;
+  }
+
+  if (gotAnything) {
+    if (levelPct < 0.0f) levelPct = 0.0f;
+    if (levelPct > 100.0f) levelPct = 100.0f;
+    if (gallons < 0) gallons = 0;
+  }
+  return gotAnything;
+}
+
+bool pointInRect(uint16_t px, uint16_t py, const Rect& r) {
+  return px >= r.x && px < (r.x + r.w) && py >= r.y && py < (r.y + r.h);
+}
+
+uint16_t statusColor(bool ok) {
+  return ok ? COLOR_GREEN : COLOR_AMBER;
+}
+
+bool linkIsLive() {
+  return hasValidPacket && (millis() - lastPacketMillis <= LINK_TIMEOUT_MS);
+}
+
+String formatGallons(int value) {
+  return String(value);
+}
+
+String formatDays(float days) {
+  if (days < 0.0f) days = 0.0f;
+  return String(days, 1);
+}
+
+String lastUpdateText() {
+  if (!hasValidPacket) return "Awaiting first packet";
+  unsigned long ageMs = millis() - lastPacketMillis;
+  if (ageMs < 1000UL) return "Updated just now";
+  unsigned long seconds = ageMs / 1000UL;
+  if (seconds < 60UL) return "Updated " + String(seconds) + "s ago";
+  unsigned long minutes = seconds / 60UL;
+  return "Updated " + String(minutes) + "m ago";
+}
+
+String headerStatusText() {
+  return linkIsLive() ? "HC-12 LIVE" : "HC-12 WAIT";
+}
+
+String packetPreview() {
+  const int maxLen = 70;
+  if (lastRaw.length() <= maxLen) return lastRaw;
+  return lastRaw.substring(0, maxLen - 3) + "...";
+}
+
+String footerLineText() {
+  return "Last update: " + lastUpdateText() + "    Packet: " + packetPreview();
+}
+
+String navLabel1() {
+  switch (currentPage) {
+    case PAGE_DASHBOARD: return "SETUP";
+    case PAGE_SETUP: return "HOME";
+    case PAGE_WIFI: return "HOME";
+    case PAGE_WIFI_SELECT: return "BACK";
+    case PAGE_WIFI_PASSWORD: return "BACK";
+  }
+  return "HOME";
+}
+
+String navLabel2() {
+  switch (currentPage) {
+    case PAGE_DASHBOARD: return "WIFI";
+    case PAGE_SETUP: return "WIFI";
+    case PAGE_WIFI: return "SETUP";
+    case PAGE_WIFI_SELECT: return "HOME";
+    case PAGE_WIFI_PASSWORD: return "HOME";
+  }
+  return "WIFI";
+}
+
+void setFontSmall() { lcd.setFont(&fonts::Font2); }
+void setFontMedium() { lcd.setFont(&fonts::Font4); }
+void setFontLarge() { lcd.setFont(&fonts::Font6); }
+void setFontXLarge() { lcd.setFont(&fonts::Font7); }
+
+void drawCardBase(int x, int y, int w, int h) {
+  lcd.fillRoundRect(x, y, w, h, RADIUS, COLOR_PANEL);
+  lcd.drawRoundRect(x, y, w, h, RADIUS, COLOR_BORDER);
+}
+
+void drawTileBase(int x, int y, int w, int h) {
+  lcd.fillRoundRect(x, y, w, h, 14, COLOR_PANEL_2);
+  lcd.drawRoundRect(x, y, w, h, 14, COLOR_BORDER);
+}
+
+void clearRect(int x, int y, int w, int h, uint16_t fillColor) {
+  lcd.fillRect(x, y, w, h, fillColor);
+}
+
+void drawSectionLabel(int x, int y, const char* label, uint16_t bgColor = COLOR_PANEL) {
+  lcd.setTextColor(COLOR_MUTED, bgColor);
+  setFontSmall();
+  lcd.setCursor(x, y);
+  lcd.print(label);
+}
+
+void drawPill(int x, int y, int w, int h, uint16_t fillColor, uint16_t borderColor, const String& text) {
+  lcd.fillRoundRect(x, y, w, h, h / 2, fillColor);
+  lcd.drawRoundRect(x, y, w, h, h / 2, borderColor);
+  lcd.setTextColor(COLOR_TEXT, fillColor);
+  setFontSmall();
+  lcd.setTextDatum(middle_center);
+  lcd.drawString(text, x + (w / 2), y + (h / 2));
+  lcd.setTextDatum(top_left);
+}
+
+void drawButton(const Rect& r, const String& label, uint16_t fillColor, uint16_t borderColor, uint16_t textColor = COLOR_TEXT) {
+  lcd.fillRoundRect(r.x, r.y, r.w, r.h, 12, fillColor);
+  lcd.drawRoundRect(r.x, r.y, r.w, r.h, 12, borderColor);
+  lcd.setTextColor(textColor, fillColor);
+  setFontSmall();
+  lcd.setTextDatum(middle_center);
+  lcd.drawString(label, r.x + (r.w / 2), r.y + (r.h / 2));
+  lcd.setTextDatum(top_left);
+}
+
+void drawProgressBar(int x, int y, int w, int h, float pct) {
+  int innerX = x + 3;
+  int innerY = y + 3;
+  int innerW = w - 6;
+  int innerH = h - 6;
+  if (innerW < 1 || innerH < 1) return;
+
+  float normalized = pct / 100.0f;
+  if (normalized < 0.0f) normalized = 0.0f;
+  if (normalized > 1.0f) normalized = 1.0f;
+  int fillW = (int)(innerW * normalized);
+  if (fillW < 0) fillW = 0;
+  if (fillW > innerW) fillW = innerW;
+
+  lcd.fillRoundRect(x, y, w, h, 12, COLOR_BG);
+  lcd.drawRoundRect(x, y, w, h, 12, COLOR_BORDER);
+  lcd.fillRoundRect(innerX, innerY, innerW, innerH, 10, COLOR_BLUE_DIM);
+  if (fillW > 0) lcd.fillRoundRect(innerX, innerY, fillW, innerH, 10, COLOR_BLUE);
+}
+
+void drawMetricTile(int x, int y, int w, int h, const char* label, const String& value, const char* unit = nullptr) {
+  drawTileBase(x, y, w, h);
+  lcd.setTextColor(COLOR_MUTED, COLOR_PANEL_2);
+  setFontSmall();
+  lcd.setCursor(x + 16, y + 12);
+  lcd.print(label);
+
+  lcd.setTextColor(COLOR_TEXT, COLOR_PANEL_2);
+  setFontLarge();
+  lcd.setCursor(x + 16, y + 30);
+  lcd.print(value);
+
+  if (unit != nullptr) {
+    lcd.setTextColor(COLOR_SUBTLE, COLOR_PANEL_2);
+    setFontSmall();
+    lcd.setTextDatum(bottom_right);
+    lcd.drawString(unit, x + w - 16, y + h - 10);
+    lcd.setTextDatum(top_left);
+  }
+}
+
+void drawValueField(int x, int y, int w, const char* label, const String& value, const char* unit, bool active = false) {
+  drawTileBase(x, y, w, 56);
+  lcd.setTextColor(COLOR_MUTED, COLOR_PANEL_2);
+  setFontSmall();
+  lcd.setCursor(x + 12, y + 8);
+  lcd.print(label);
+
+  lcd.setTextColor(COLOR_TEXT, COLOR_PANEL_2);
+  setFontMedium();
+  lcd.setCursor(x + 12, y + 26);
+  lcd.print(value);
+
+  lcd.setTextColor(COLOR_SUBTLE, COLOR_PANEL_2);
+  setFontSmall();
+  lcd.setCursor(x + 92, y + 32);
+  lcd.print(unit);
+
+  if (active) {
+    lcd.drawRoundRect(x + 3, y + 3, w - 6, 50, 12, COLOR_BLUE);
+  }
+}
+
+void loadCalibrationSettings() {
+  calibTankHeightFt = prefs.getFloat("tank_height_ft", 9.5f);
+  calibTankFullGal = prefs.getFloat("tank_full_gal", (float)CISTERN_CAPACITY_DEFAULT);
+  calibBaselinePct = prefs.getFloat("baseline_pct", 51.8f);
+  calibBaselineTs = prefs.getString("baseline_ts", "Not set");
+  calibForceBaseline = prefs.getBool("force_baseline", false);
+}
+
+void saveCalibrationSettings() {
+  prefs.putFloat("tank_height_ft", calibTankHeightFt);
+  prefs.putFloat("tank_full_gal", calibTankFullGal);
+  prefs.putFloat("baseline_pct", calibBaselinePct);
+  prefs.putString("baseline_ts", calibBaselineTs);
+  prefs.putBool("force_baseline", calibForceBaseline);
+}
+
+void loadWiFiCredentials() {
+  savedWifiSsid = prefs.getString("wifi_ssid", "");
+  savedWifiPassword = prefs.getString("wifi_pass", "");
+}
+
+void saveWiFiCredentials(const String& ssid, const String& password) {
+  savedWifiSsid = ssid;
+  savedWifiPassword = password;
+  prefs.putString("wifi_ssid", ssid);
+  prefs.putString("wifi_pass", password);
+}
+
+void clearWiFiCredentials() {
+  savedWifiSsid = "";
+  savedWifiPassword = "";
+  prefs.remove("wifi_ssid");
+  prefs.remove("wifi_pass");
+}
+
+String makeSavedTimestamp() {
+  return "Saved on device";
+}
+
+float pctFromDownFromTop(float tankHeightFt, int downFt, int downIn) {
+  float down = (float)downFt + ((float)downIn / 12.0f);
+  float depth = tankHeightFt - down;
+  if (tankHeightFt <= 0.0f) return 0.0f;
+  float pct = (depth / tankHeightFt) * 100.0f;
+  if (pct < 0.0f) pct = 0.0f;
+  if (pct > 100.0f) pct = 100.0f;
+  return pct;
+}
+
+float galFromPct(float tankFullGal, float pct) {
+  return (pct / 100.0f) * tankFullGal;
+}
+
+void refreshCalibrationPreview() {
+  float pct = pctFromDownFromTop(calibTankHeightFt, calibDownFt, calibDownIn);
+  float gal = galFromPct(calibTankFullGal, pct);
+  calibPreviewMessage = "Preview: down " + String(calibDownFt) + "' " + String(calibDownIn) + "\" => " + String(pct, 1) + "% (~" + String((int)roundf(gal)) + " imp gal)";
+}
+
+String issueCalibrationCommand(const String& cmd) {
+  if (!SCREEN_HC12_TX_ENABLED) {
+    calibCommandResult = "Not sent: " + cmd + " (screen HC-12 is RX-only)";
+    return calibCommandResult;
+  }
+  lastIssuedCommand = cmd;
+  HC12Serial.print(cmd);
+  HC12Serial.print('\n');   // PCB command parser expects newline-terminated commands.
+  calibCommandResult = "Sent: " + cmd;
+  return calibCommandResult;
+}
+
+void triggerSetupButtonHighlight(SetupCommandButton buttonId) {
+  highlightedSetupButton = buttonId;
+  setupButtonHighlightUntil = millis() + 180UL;
+}
+
+void runBaselineSaveAction() {
+  calibBaselinePct = pctFromDownFromTop(calibTankHeightFt, calibDownFt, calibDownIn);
+  calibBaselineTs = makeSavedTimestamp();
+  saveCalibrationSettings();
+  refreshCalibrationPreview();
+
+  // Mirror the Flask app flow:
+  // 1. save the baseline locally on the display
+  // 2. clear remote calibration
+  // 3. send SET_BASELINE <pct>
+  issueCalibrationCommand("CLR_CAL");
+  issueCalibrationCommand("SET_BASELINE " + String(calibBaselinePct, 1));
+  calibResultMessage = SCREEN_HC12_TX_ENABLED
+    ? "Baseline saved and pushed to remote board"
+    : "Baseline saved locally; remote push skipped because display HC-12 is RX-only";
+}
+
+void toggleBaselineOverride() {
+  calibForceBaseline = !calibForceBaseline;
+  prefs.putBool("force_baseline", calibForceBaseline);
+  calibResultMessage = String("Baseline Override: ") + (calibForceBaseline ? "ON" : "AUTO");
+}
+
+uint8_t detectGT911Address() {
+  const uint8_t candidates[] = { GT911_ADDR_PRIMARY, GT911_ADDR_ALT };
+  for (uint8_t addr : candidates) {
+    Wire.beginTransmission(addr);
+    if (Wire.endTransmission() == 0) return addr;
+  }
+  return 0;
+}
+
+String wifiStatusLabel() {
+  wl_status_t status = WiFi.status();
+  switch (status) {
+    case WL_CONNECTED: return "Connected";
+    case WL_CONNECT_FAILED: return "Connect Failed";
+    case WL_CONNECTION_LOST: return "Connection Lost";
+    case WL_DISCONNECTED: return "Disconnected";
+    case WL_IDLE_STATUS: return "Idle";
+    case WL_NO_SSID_AVAIL: return "SSID Not Found";
+    default: return wifiConnectInProgress ? "Connecting..." : "Disconnected";
+  }
+}
+
+String wifiCurrentSsid() {
+  if (WiFi.status() == WL_CONNECTED) return WiFi.SSID();
+  if (savedWifiSsid.length() > 0) return savedWifiSsid;
+  return "None";
+}
+
+String wifiIpText() {
+  if (WiFi.status() == WL_CONNECTED) return WiFi.localIP().toString();
+  return "Not assigned";
+}
+
+String wifiSummaryLine() {
+  return wifiStatusLabel() + "|" + wifiCurrentSsid() + "|" + wifiIpText() + "|" + wifiActionMessage + "|" + String(scanNetworkCount);
+}
+
+String wifiListSignature() {
+  String sig = String(scanNetworkCount) + "|" + (wifiScanInProgress ? "scan" : "idle");
+  for (int i = 0; i < scanNetworkCount; ++i) {
+    sig += "|" + scanSsids[i] + ":" + String(scanRssi[i]) + ":" + (scanOpen[i] ? "o" : "s");
+  }
+  return sig;
+}
+
+bool cloudReady() {
+  return WiFi.status() == WL_CONNECTED;
+}
+
+String jsonEscape(const String& value) {
+  String out;
+  out.reserve(value.length() + 8);
+
+  for (size_t i = 0; i < value.length(); ++i) {
+    char c = value[i];
+    switch (c) {
+      case '\\': out += "\\\\"; break;
+      case '"':  out += "\\\""; break;
+      case '\n': out += "\\n"; break;
+      case '\r': out += "\\r"; break;
+      case '\t': out += "\\t"; break;
+      default:   out += c; break;
+    }
+  }
+
+  return out;
+}
+
+String jsonGetString(const String& json, const String& key) {
+  String needle = "\"" + key + "\":\"";
+  int start = json.indexOf(needle);
+  if (start < 0) return "";
+  start += needle.length();
+
+  String out = "";
+  bool escaped = false;
+  for (int i = start; i < json.length(); ++i) {
+    char c = json[i];
+    if (escaped) {
+      switch (c) {
+        case 'n': out += '\n'; break;
+        case 'r': out += '\r'; break;
+        case 't': out += '\t'; break;
+        default: out += c; break;
+      }
+      escaped = false;
+      continue;
+    }
+    if (c == '\\') {
+      escaped = true;
+      continue;
+    }
+    if (c == '"') break;
+    out += c;
+  }
+  return out;
+}
+
+bool jsonGetBool(const String& json, const String& key, bool defaultValue) {
+  String trueNeedle = "\"" + key + "\":true";
+  if (json.indexOf(trueNeedle) >= 0) return true;
+  String falseNeedle = "\"" + key + "\":false";
+  if (json.indexOf(falseNeedle) >= 0) return false;
+  return defaultValue;
+}
+
+bool postCisternReading() {
+  // Cloud posting is optional. The local screen and HC-12 path keep working
+  // even if Wi-Fi is down or the Flask server is unavailable.
+  if (!cloudReady()) {
+    lastPostSuccess = false;
+    lastPostHttpCode = 0;
+    return false;
+  }
+
+  if (!hasValidPacket) {
+    lastPostSuccess = false;
+    lastPostHttpCode = 0;
+    return false;
+  }
+
+  unsigned long now = millis();
+  bool valuesChanged =
+    (fabsf(levelPct - lastPostedLevelPct) > 0.05f) ||
+    (gallons != lastPostedGallons) ||
+    (adcValue != lastPostedAdc) ||
+    (calibrated != lastPostedCalibrated);
+
+  bool intervalElapsed = (lastPostMillis == 0) || (now - lastPostMillis >= SERVER_POST_INTERVAL_MS);
+  if (!valuesChanged && !intervalElapsed) {
+    return false;
+  }
+
+  WiFiClient client;
+  HTTPClient http;
+
+  Serial.print("POST URL: ");
+  Serial.println(SERVER_URL);
+
+  if (!http.begin(client, SERVER_URL)) {
+    Serial.println("POST failed: http.begin() failed");
+    lastPostSuccess = false;
+    lastPostHttpCode = -1;
+    return false;
+  }
+
+  http.setTimeout(SERVER_POST_TIMEOUT_MS);
+  http.addHeader("Content-Type", "application/json");
+
+  String payload = "{";
+  payload += "\"device_id\":\"" + jsonEscape(String(DEVICE_ID)) + "\",";
+  payload += "\"level_pct\":" + String(levelPct, 1) + ",";
+  payload += "\"gallons\":" + String(gallons) + ",";
+  payload += "\"adc\":" + String(adcValue) + ",";
+  payload += "\"calibrated\":";
+  payload += (calibrated ? "true" : "false");
+  payload += ",";
+  payload += "\"raw\":\"" + jsonEscape(lastRaw) + "\"";
+  payload += "}";
+
+  int httpCode = http.POST(payload);
+  lastPostMillis = now;
+  lastPostHttpCode = httpCode;
+  lastPostSuccess = (httpCode >= 200 && httpCode < 300);
+
+  if (lastPostSuccess) {
+    lastPostedLevelPct = levelPct;
+    lastPostedGallons = gallons;
+    lastPostedAdc = adcValue;
+    lastPostedCalibrated = calibrated;
+    Serial.print("POST success, HTTP code: ");
+    Serial.println(httpCode);
+  } else {
+    Serial.print("POST failed, HTTP code: ");
+    Serial.println(httpCode);
+    if (httpCode <= 0) {
+      Serial.print("POST error: ");
+      Serial.println(http.errorToString(httpCode));
+    }
+  }
+
+  http.end();
+  return lastPostSuccess;
+}
+
+bool postCommandResultToServer(const String& cmdId, const String& cmd, const String& result, bool ok) {
+  if (!cloudReady() || cmdId.length() == 0) return false;
+
+  WiFiClient client;
+  HTTPClient http;
+  if (!http.begin(client, SERVER_COMMAND_RESULT_URL)) {
+    Serial.println("Command result POST failed: http.begin() failed");
+    return false;
+  }
+
+  http.setTimeout(SERVER_POST_TIMEOUT_MS);
+  http.addHeader("Content-Type", "application/json");
+
+  String payload = "{";
+  payload += "\"device_id\":\"" + jsonEscape(String(DEVICE_ID)) + "\",";
+  payload += "\"cmd_id\":\"" + jsonEscape(cmdId) + "\",";
+  payload += "\"cmd\":\"" + jsonEscape(cmd) + "\",";
+  payload += "\"result\":\"" + jsonEscape(result) + "\",";
+  payload += "\"ok\":";
+  payload += (ok ? "true" : "false");
+  payload += "}";
+
+  int httpCode = http.POST(payload);
+  bool success = (httpCode >= 200 && httpCode < 300);
+  Serial.print("Command result POST HTTP code: ");
+  Serial.println(httpCode);
+  http.end();
+  return success;
+}
+
+void pollServerForCommand() {
+  if (!cloudReady() || bridgeCommandPending) return;
+
+  unsigned long now = millis();
+  if (now - lastCommandPollMillis < SERVER_COMMAND_POLL_INTERVAL_MS) return;
+  lastCommandPollMillis = now;
+
+  WiFiClient client;
+  HTTPClient http;
+  String url = String(SERVER_COMMAND_URL) + "?device_id=" + String(DEVICE_ID);
+
+  if (!http.begin(client, url)) {
+    Serial.println("Command poll skipped: http.begin() failed");
+    return;
+  }
+
+  http.setTimeout(SERVER_POST_TIMEOUT_MS);
+  int httpCode = http.GET();
+  Serial.print("Command poll HTTP code: ");
+  Serial.println(httpCode);
+
+  if (httpCode >= 200 && httpCode < 300) {
+    String body = http.getString();
+    bool pending = jsonGetBool(body, "pending", false);
+    if (pending) {
+      String cmdId = jsonGetString(body, "cmd_id");
+      String cmd = jsonGetString(body, "cmd");
+      if (cmdId.length() > 0 && cmd.length() > 0) {
+        bridgeCommandPending = true;
+        bridgePendingCommandId = cmdId;
+        bridgePendingCommand = cmd;
+        bridgePendingCommandMillis = now;
+        Serial.print("Dispatching bridged command: ");
+        Serial.println(cmd);
+        issueCalibrationCommand(cmd);
+      }
+    }
+  }
+
+  http.end();
+}
+
+void startWiFiConnection(const String& ssid, const String& password) {
+  if (ssid.length() == 0) {
+    wifiActionMessage = "No saved Wi-Fi credentials";
+    wifiConnectInProgress = false;
+    return;
+  }
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(ssid.c_str(), password.c_str());
+  wifiConnectInProgress = true;
+  wifiActionMessage = "Connecting to " + ssid;
+}
+
+void beginWifiScan() {
+  WiFi.mode(WIFI_STA);
+  WiFi.scanDelete();
+  int result = WiFi.scanNetworks(true, true);
+  wifiScanInProgress = (result == WIFI_SCAN_RUNNING);
+  scanNetworkCount = 0;
+  wifiActionMessage = wifiScanInProgress ? "Scanning for networks..." : "Failed to start scan";
+}
+
+void forgetWifiAction() {
+  WiFi.disconnect(true, true);
+  clearWiFiCredentials();
+  wifiConnectInProgress = false;
+  wifiActionMessage = "Saved Wi-Fi forgotten";
+}
+
+void collectScanResults(int resultCount) {
+  scanNetworkCount = min(resultCount, MAX_SCAN_NETWORKS);
+  for (int i = 0; i < scanNetworkCount; ++i) {
+    scanSsids[i] = WiFi.SSID(i);
+    scanRssi[i] = WiFi.RSSI(i);
+    scanOpen[i] = (WiFi.encryptionType(i) == WIFI_AUTH_OPEN);
+  }
+  WiFi.scanDelete();
+  wifiScanInProgress = false;
+  wifiActionMessage = (scanNetworkCount > 0) ? "Select a network to continue" : "No networks found";
+}
+
+String maskedPassword() {
+  if (wifiPasswordEntry.length() == 0) return "(empty)";
+  String masked = "";
+  for (size_t i = 0; i < wifiPasswordEntry.length(); ++i) masked += '*';
+  return masked;
+}
+
+String calibEntryTitle() {
+  switch (activeCalibEntryField) {
+    case CALIB_ENTRY_TANK_HEIGHT: return "Tank height (ft)";
+    case CALIB_ENTRY_TANK_FULL: return "Tank full (imp gal)";
+    case CALIB_ENTRY_DOWN_FT: return "Down from top (ft)";
+    case CALIB_ENTRY_DOWN_IN: return "Down inches (in)";
+    default: return "Edit value";
+  }
+}
+
+bool calibEntryAllowsDecimal() {
+  return activeCalibEntryField == CALIB_ENTRY_TANK_HEIGHT || activeCalibEntryField == CALIB_ENTRY_TANK_FULL;
+}
+
+Rect calibKeyRect(int row, int col) {
+  return { 182 + col * 124, 254 + row * 34, 104, 30 };
+}
+
+char calibKeyAt(int row, int col) {
+  const char* rows[] = { "123", "456", "789", ".0#" };
+  if (row < 0 || row > 3 || col < 0 || col > 2) return '\0';
+  return rows[row][col];
+}
+
+void openCalibEntry(CalibEntryField field) {
+  activeCalibEntryField = field;
+  switch (field) {
+    case CALIB_ENTRY_TANK_HEIGHT: calibEntryBuffer = String(calibTankHeightFt, 1); break;
+    case CALIB_ENTRY_TANK_FULL: calibEntryBuffer = String((int)roundf(calibTankFullGal)); break;
+    case CALIB_ENTRY_DOWN_FT: calibEntryBuffer = String(calibDownFt); break;
+    case CALIB_ENTRY_DOWN_IN: calibEntryBuffer = String(calibDownIn); break;
+    default: calibEntryBuffer = ""; break;
+  }
+  lcd.startWrite();
+  updateSetupFieldArea();
+  drawCalibEntryModal();
+  lcd.endWrite();
+}
+
+void closeCalibEntry() {
+  activeCalibEntryField = CALIB_ENTRY_NONE;
+  calibEntryBuffer = "";
+  drawSetupPage();
+  updateSetupPageDynamic();
+}
+
+void applyCalibEntry() {
+  if (activeCalibEntryField == CALIB_ENTRY_NONE || calibEntryBuffer.length() == 0) {
+    closeCalibEntry();
+    return;
+  }
+
+  switch (activeCalibEntryField) {
+    case CALIB_ENTRY_TANK_HEIGHT:
+      calibTankHeightFt = constrain(calibEntryBuffer.toFloat(), 1.0f, 20.0f);
+      saveCalibrationSettings();
+      break;
+    case CALIB_ENTRY_TANK_FULL:
+      calibTankFullGal = constrain(calibEntryBuffer.toFloat(), 100.0f, 20000.0f);
+      saveCalibrationSettings();
+      break;
+    case CALIB_ENTRY_DOWN_FT:
+      calibDownFt = constrain(calibEntryBuffer.toInt(), 0, 20);
+      break;
+    case CALIB_ENTRY_DOWN_IN:
+      calibDownIn = constrain(calibEntryBuffer.toInt(), 0, 11);
+      break;
+    default:
+      break;
+  }
+
+  refreshCalibrationPreview();
+  calibResultMessage = "Value updated";
+  closeCalibEntry();
+}
+
+char keyboardCharAt(int row, int col) {
+  const char* row0 = "1234567890";
+  const char* row1 = wifiKeyboardShift ? "QWERTYUIOP" : "qwertyuiop";
+  const char* row2 = wifiKeyboardShift ? "ASDFGHJKL." : "asdfghjkl.";
+  const char* row3 = wifiKeyboardShift ? "ZXCVBNM-_@" : "zxcvbnm-_@";
+  const char* rows[] = { row0, row1, row2, row3 };
+  if (row < 0 || row >= KEYBOARD_ROWS || col < 0 || col >= KEYBOARD_COLS) return '\0';
+  return rows[row][col];
+}
+
+Rect keyboardKeyRect(int row, int col) {
+  return { KEYBOARD_START_X + col * (KEY_W + KEY_GAP), KEYBOARD_START_Y + row * (KEY_H + KEY_GAP), KEY_W, KEY_H };
+}
+
+void drawHeader(const char* subtitle) {
+  drawCardBase(HEADER_X, HEADER_Y, HEADER_W, HEADER_H);
+  lcd.setTextColor(COLOR_TEXT, COLOR_PANEL);
+  setFontMedium();
+  lcd.setCursor(HEADER_X + 18, HEADER_Y + 15);
+  lcd.print("Cistern Monitor");
+  lcd.setTextColor(COLOR_SUBTLE, COLOR_PANEL);
+  setFontSmall();
+  lcd.setCursor(HEADER_X + 210, HEADER_Y + 20);
+  lcd.print(subtitle);
+  drawHeaderNavButtons();
+  drawHeaderStatusPill();
+}
+
+void drawHeaderNavButtons() {
+  clearRect(NAV_BTN_1.x - 6, NAV_BTN_1.y - 2, 170, NAV_BTN_1.h + 4, COLOR_PANEL);
+  drawButton(NAV_BTN_1, navLabel1(), COLOR_PANEL_2, COLOR_BORDER);
+  drawButton(NAV_BTN_2, navLabel2(), COLOR_BLUE_DIM, COLOR_BLUE);
+}
+
+void drawHeaderStatusPill() {
+  String status = headerStatusText();
+  clearRect(STATUS_PILL.x - 8, STATUS_PILL.y - 2, STATUS_PILL.w + 16, STATUS_PILL.h + 4, COLOR_PANEL);
+  drawPill(STATUS_PILL.x, STATUS_PILL.y, STATUS_PILL.w, STATUS_PILL.h, linkIsLive() ? COLOR_GREEN : COLOR_AMBER, statusColor(linkIsLive()), status);
+  cachedHeaderStatus = status;
+}
+
+void drawCalibEntryModal() {
+  if (activeCalibEntryField == CALIB_ENTRY_NONE) return;
+
+  clearRect(CALIB_MODAL.x - 2, CALIB_MODAL.y - 2, CALIB_MODAL.w + 4, CALIB_MODAL.h + 4, COLOR_BG);
+  drawCardBase(CALIB_MODAL.x, CALIB_MODAL.y, CALIB_MODAL.w, CALIB_MODAL.h);
+  drawSectionLabel(CALIB_MODAL.x + 24, CALIB_MODAL.y + 18, "NUMERIC ENTRY");
+
+  lcd.setTextColor(COLOR_TEXT, COLOR_PANEL);
+  setFontMedium();
+  lcd.setCursor(CALIB_MODAL.x + 24, CALIB_MODAL.y + 48);
+  lcd.print(calibEntryTitle());
+
+  drawTileBase(CALIB_ENTRY_DISPLAY.x, CALIB_ENTRY_DISPLAY.y, CALIB_ENTRY_DISPLAY.w, CALIB_ENTRY_DISPLAY.h);
+  lcd.setTextColor(COLOR_TEXT, COLOR_PANEL_2);
+  setFontLarge();
+  lcd.setCursor(CALIB_ENTRY_DISPLAY.x + 16, CALIB_ENTRY_DISPLAY.y + 22);
+  lcd.print(calibEntryBuffer.length() > 0 ? calibEntryBuffer : "0");
+
+  for (int row = 0; row < 4; ++row) {
+    for (int col = 0; col < 3; ++col) {
+      char key = calibKeyAt(row, col);
+      if (key == '#') continue;
+      if (key == '.' && !calibEntryAllowsDecimal()) continue;
+      drawButton(calibKeyRect(row, col), String(key), COLOR_PANEL_2, COLOR_BORDER);
+    }
+  }
+
+  drawButton(CALIB_KEY_CANCEL, "CANCEL", COLOR_PANEL_2, COLOR_BORDER);
+  drawButton(CALIB_KEY_CLEAR, "CLEAR", COLOR_PANEL_2, COLOR_BORDER);
+  drawButton(CALIB_KEY_BKSP, "BKSP", COLOR_PANEL_2, COLOR_BORDER);
+  drawButton(CALIB_KEY_APPLY, "APPLY", COLOR_BLUE_DIM, COLOR_BLUE);
+}
+
+void updateCalibEntryDisplay() {
+  if (activeCalibEntryField == CALIB_ENTRY_NONE) return;
+  clearRect(CALIB_ENTRY_DISPLAY.x + 4, CALIB_ENTRY_DISPLAY.y + 4, CALIB_ENTRY_DISPLAY.w - 8, CALIB_ENTRY_DISPLAY.h - 8, COLOR_PANEL_2);
+  lcd.setTextColor(COLOR_TEXT, COLOR_PANEL_2);
+  setFontLarge();
+  lcd.setCursor(CALIB_ENTRY_DISPLAY.x + 16, CALIB_ENTRY_DISPLAY.y + 22);
+  lcd.print(calibEntryBuffer.length() > 0 ? calibEntryBuffer : "0");
+}
+
+void drawDashboardFrame() {
+  lcd.startWrite();
+  lcd.fillScreen(COLOR_BG);
+  drawHeader("Dashboard");
+
+  drawCardBase(LEFT_X, LEFT_Y, LEFT_W, LEFT_H);
+  drawSectionLabel(LEFT_X + 18, LEFT_Y + 16, "CURRENT WATER LEVEL");
+
+  drawCardBase(RIGHT_X, RIGHT_Y, RIGHT_W, RIGHT_H);
+  drawSectionLabel(RIGHT_X + 18, RIGHT_Y + 16, "SYSTEM STATUS");
+
+  drawMetricTile(16, TILE_Y, TILE_W, TILE_H, "Average Daily Use", String(AVG_DAILY_USE_GAL, 1), "gal/day");
+  drawMetricTile(16 + TILE_W + TILE_GAP, TILE_Y, TILE_W, TILE_H, "Remaining Volume", formatGallons(gallons), "gallons");
+  drawMetricTile(16 + (TILE_W + TILE_GAP) * 2, TILE_Y, TILE_W, TILE_H, "Days To Empty", formatDays((AVG_DAILY_USE_GAL > 0.01f) ? (gallons / AVG_DAILY_USE_GAL) : 0.0f), "days");
+
+  lcd.drawFastHLine(FOOTER_X, FOOTER_Y - 8, FOOTER_W, COLOR_BORDER);
+  lcd.endWrite();
+}
+
+void drawSetupCommandButton(const Rect& r, const char* label, SetupCommandButton buttonId, bool primary) {
+  bool highlighted = (highlightedSetupButton == buttonId) && (millis() < setupButtonHighlightUntil);
+  uint16_t fill = primary ? COLOR_BLUE_DIM : COLOR_PANEL_2;
+  uint16_t border = primary ? COLOR_BLUE : COLOR_BORDER;
+
+  if (highlighted) {
+    fill = COLOR_GREEN;
+    border = COLOR_GREEN;
+  }
+
+  drawButton(r, label, fill, border);
+}
+
+void drawStatusRow(int x, int y, const char* label, const String& value, uint16_t valueColor = COLOR_TEXT) {
+  lcd.setTextColor(COLOR_MUTED, COLOR_PANEL);
+  setFontSmall();
+  lcd.setCursor(x, y);
+  lcd.print(label);
+  lcd.setTextColor(valueColor, COLOR_PANEL);
+  setFontMedium();
+  lcd.setCursor(x, y + 16);
+  lcd.print(value);
+}
+
+void updateLeftCardDynamic() {
+  int contentX = LEFT_X + 18;
+  int contentY = LEFT_Y + 42;
+  int contentW = LEFT_W - 36;
+  int contentH = LEFT_H - 58;
+  clearRect(contentX, contentY, contentW, contentH, COLOR_PANEL);
+
+  lcd.setTextColor(COLOR_TEXT, COLOR_PANEL);
+  setFontXLarge();
+  lcd.setCursor(contentX, LEFT_Y + 54);
+  lcd.printf("%.1f", levelPct);
+
+  lcd.setTextColor(COLOR_TEXT, COLOR_PANEL);
+  setFontMedium();
+  lcd.setCursor(contentX + 130, LEFT_Y + 72);
+  lcd.print("%");
+
+  lcd.setTextColor(COLOR_MUTED, COLOR_PANEL);
+  setFontSmall();
+  lcd.setCursor(contentX + 210, LEFT_Y + 86);
+  lcd.print("of available capacity");
+
+  lcd.setTextColor(COLOR_TEXT, COLOR_PANEL);
+  setFontMedium();
+  lcd.setCursor(contentX, LEFT_Y + 150);
+  lcd.print(formatGallons(gallons));
+  lcd.print(" gal");
+
+  lcd.setTextColor(COLOR_SUBTLE, COLOR_PANEL);
+  setFontSmall();
+  lcd.setCursor(contentX + 168, LEFT_Y + 157);
+  lcd.printf("of %.0f gal", calibTankFullGal);
+
+  drawProgressBar(contentX, LEFT_Y + 188, LEFT_W - 36, 24, levelPct);
+}
+
+void updateRightCardDynamic() {
+  int contentX = RIGHT_X + 18;
+  int contentY = RIGHT_Y + 42;
+  int contentW = RIGHT_W - 36;
+  int contentH = RIGHT_H - 58;
+  clearRect(contentX, contentY, contentW, contentH, COLOR_PANEL);
+
+  drawStatusRow(contentX, contentY, "Monitoring State", linkIsLive() ? "Monitoring Active" : "Signal Waiting", linkIsLive() ? COLOR_TEXT : COLOR_AMBER);
+  drawStatusRow(contentX, contentY + 52, "Mode", calibrated ? "CAL" : "RAW", calibrated ? COLOR_BLUE : COLOR_SUBTLE);
+  drawStatusRow(contentX, contentY + 104, "ADC Value", String(adcValue));
+  drawStatusRow(contentX, contentY + 156, "Link", "HC-12 RX ONLY", linkIsLive() ? COLOR_TEXT : COLOR_SUBTLE);
+}
+
+void updateBottomTilesDynamic() {
+  drawMetricTile(16, TILE_Y, TILE_W, TILE_H, "Average Daily Use", String(AVG_DAILY_USE_GAL, 1), "gal/day");
+  drawMetricTile(16 + TILE_W + TILE_GAP, TILE_Y, TILE_W, TILE_H, "Remaining Volume", formatGallons(gallons), "gallons");
+  drawMetricTile(16 + (TILE_W + TILE_GAP) * 2, TILE_Y, TILE_W, TILE_H, "Days To Empty", formatDays((AVG_DAILY_USE_GAL > 0.01f) ? (gallons / AVG_DAILY_USE_GAL) : 0.0f), "days");
+}
+
+void updateFooterDynamic() {
+  cachedFooterLine = footerLineText();
+  clearRect(FOOTER_X, FOOTER_Y, FOOTER_W, FOOTER_H, COLOR_BG);
+  lcd.setTextColor(COLOR_SUBTLE, COLOR_BG);
+  setFontSmall();
+  lcd.setCursor(FOOTER_X, FOOTER_Y + 3);
+  lcd.print(cachedFooterLine);
+}
+
+void updateDashboardData() {
+  if (currentPage != PAGE_DASHBOARD) return;
+  lcd.startWrite();
+  updateLeftCardDynamic();
+  updateRightCardDynamic();
+  updateBottomTilesDynamic();
+  updateFooterDynamic();
+  drawHeaderStatusPill();
+  lcd.endWrite();
+}
+
+static const Rect BTN_CAL_EMPTY = { 428, 130, 150, 42 };
+static const Rect BTN_CAL_FULL  = { 592, 130, 150, 42 };
+static const Rect BTN_CLR_CAL   = { 428, 184, 150, 42 };
+static const Rect BTN_GET_CAL   = { 592, 184, 150, 42 };
+static const Rect STEP_TANK_H = { 24, 278, 184, 56 };
+static const Rect STEP_TANK_F = { 216, 278, 184, 56 };
+static const Rect STEP_DOWN_F = { 408, 278, 168, 56 };
+static const Rect STEP_DOWN_I = { 584, 278, 168, 56 };
+static const Rect BTN_CALC_BASE = { 24, 346, 160, 42 };
+static const Rect BTN_SAVE_BASE = { 194, 346, 196, 42 };
+static const Rect BTN_TOGGLE_OVR = { 408, 346, 190, 42 };
+
+void drawSetupPage() {
+  lcd.startWrite();
+  lcd.fillScreen(COLOR_BG);
+  drawHeader("Setup / Calibration");
+  drawCardBase(16, 84, 392, 150);
+  drawSectionLabel(34, 102, "LIVE SENSOR SNAPSHOT");
+  drawCardBase(424, 84, 360, 150);
+  drawSectionLabel(442, 102, "COMMAND ACTIONS");
+  drawCardBase(16, 250, 768, 194);
+  drawSectionLabel(34, 260, "BASELINE SETUP");
+  drawSetupCommandButton(BTN_CAL_EMPTY, "CAL EMPTY", SETUP_BTN_CAL_EMPTY, true);
+  drawSetupCommandButton(BTN_CAL_FULL, "CAL FULL", SETUP_BTN_CAL_FULL, true);
+  drawSetupCommandButton(BTN_CLR_CAL, "CLR CAL", SETUP_BTN_CLR_CAL, false);
+  drawSetupCommandButton(BTN_GET_CAL, "GET CAL", SETUP_BTN_GET_CAL, false);
+  drawButton(BTN_CALC_BASE, "CALCULATE", COLOR_PANEL_2, COLOR_BORDER);
+  drawButton(BTN_SAVE_BASE, "SAVE BASELINE", COLOR_BLUE_DIM, COLOR_BLUE);
+  lcd.endWrite();
+}
+
+void updateSetupLiveSnapshot() {
+  clearRect(34, 122, 340, 96, COLOR_PANEL);
+  drawStatusRow(34, 126, "Percent Full", String(levelPct, 1) + "%");
+  drawStatusRow(190, 126, "Gallons", String(gallons));
+  drawStatusRow(34, 178, "ADC", String(adcValue));
+  drawStatusRow(190, 178, "Mode", calibrated ? "CAL" : "RAW", calibrated ? COLOR_BLUE : COLOR_SUBTLE);
+}
+
+void updateSetupFieldArea() {
+  clearRect(34, 286, 730, 144, COLOR_PANEL);
+  drawValueField(STEP_TANK_H.x, STEP_TANK_H.y, STEP_TANK_H.w, "Tank height", String(calibTankHeightFt, 1), "ft", activeCalibEntryField == CALIB_ENTRY_TANK_HEIGHT);
+  drawValueField(STEP_TANK_F.x, STEP_TANK_F.y, STEP_TANK_F.w, "Tank full", String((int)roundf(calibTankFullGal)), "imp gal", activeCalibEntryField == CALIB_ENTRY_TANK_FULL);
+  drawValueField(STEP_DOWN_F.x, STEP_DOWN_F.y, STEP_DOWN_F.w, "Down from top", String(calibDownFt), "ft", activeCalibEntryField == CALIB_ENTRY_DOWN_FT);
+  drawValueField(STEP_DOWN_I.x, STEP_DOWN_I.y, STEP_DOWN_I.w, "Down inches", String(calibDownIn), "in", activeCalibEntryField == CALIB_ENTRY_DOWN_IN);
+  drawButton(BTN_CALC_BASE, "CALCULATE", COLOR_PANEL_2, COLOR_BORDER);
+  drawButton(BTN_SAVE_BASE, "SAVE BASELINE", COLOR_BLUE_DIM, COLOR_BLUE);
+  drawButton(BTN_TOGGLE_OVR, calibForceBaseline ? "OVERRIDE: ON" : "OVERRIDE: AUTO", calibForceBaseline ? COLOR_AMBER : COLOR_PANEL_2, calibForceBaseline ? COLOR_AMBER : COLOR_BORDER);
+}
+
+void updateSetupCommandArea() {
+  clearRect(442, 122, 320, 112, COLOR_PANEL);
+  drawSetupCommandButton(BTN_CAL_EMPTY, "CAL EMPTY", SETUP_BTN_CAL_EMPTY, true);
+  drawSetupCommandButton(BTN_CAL_FULL, "CAL FULL", SETUP_BTN_CAL_FULL, true);
+  drawSetupCommandButton(BTN_CLR_CAL, "CLR CAL", SETUP_BTN_CLR_CAL, false);
+  drawSetupCommandButton(BTN_GET_CAL, "GET CAL", SETUP_BTN_GET_CAL, false);
+
+  lcd.setTextColor(COLOR_SUBTLE, COLOR_PANEL);
+  setFontSmall();
+  lcd.setCursor(442, 228);
+  lcd.print(calibCommandResult);
+}
+
+void updateCalibrationMessages() {
+  clearRect(24, 392, 730, 40, COLOR_PANEL);
+  lcd.setTextColor(COLOR_TEXT, COLOR_PANEL);
+  setFontSmall();
+  lcd.setCursor(24, 396);
+  lcd.print(calibPreviewMessage);
+  lcd.setTextColor(COLOR_SUBTLE, COLOR_PANEL);
+  lcd.setCursor(24, 418);
+  lcd.print("Saved baseline: ");
+  lcd.print(String(calibBaselinePct, 1));
+  lcd.print("% (");
+  lcd.print(calibBaselineTs);
+  lcd.print(")");
+  lcd.setCursor(408, 418);
+  lcd.print(calibResultMessage);
+}
+
+void updateSetupPageDynamic() {
+  if (currentPage != PAGE_SETUP) return;
+  lcd.startWrite();
+  updateSetupLiveSnapshot();
+  updateSetupCommandArea();
+  updateSetupFieldArea();
+  updateCalibrationMessages();
+  if (activeCalibEntryField != CALIB_ENTRY_NONE) {
+    drawCalibEntryModal();
+  }
+  lcd.endWrite();
+}
+
+static const Rect BTN_WIFI_SCAN = { 34, 308, 170, 42 };
+static const Rect BTN_WIFI_RECONNECT = { 220, 308, 170, 42 };
+static const Rect BTN_WIFI_FORGET = { 406, 308, 170, 42 };
+
+void drawWifiPage() {
+  lcd.startWrite();
+  lcd.fillScreen(COLOR_BG);
+  drawHeader("Wi-Fi Settings");
+  drawCardBase(16, 84, 768, 154);
+  drawSectionLabel(34, 102, "WIRELESS STATUS");
+  drawCardBase(16, 254, 768, 172);
+  drawSectionLabel(34, 272, "WI-FI CONTROLS");
+  drawButton(BTN_WIFI_SCAN, "SCAN NETWORKS", COLOR_BLUE_DIM, COLOR_BLUE);
+  drawButton(BTN_WIFI_RECONNECT, "RECONNECT", COLOR_PANEL_2, COLOR_BORDER);
+  drawButton(BTN_WIFI_FORGET, "FORGET WI-FI", COLOR_PANEL_2, COLOR_BORDER);
+  lcd.endWrite();
+}
+
+void updateWifiStatusArea() {
+  clearRect(34, 122, 730, 98, COLOR_PANEL);
+  drawStatusRow(34, 126, "Status", wifiStatusLabel(), WiFi.status() == WL_CONNECTED ? COLOR_TEXT : COLOR_AMBER);
+  drawStatusRow(250, 126, "Current SSID", wifiCurrentSsid());
+  drawStatusRow(34, 180, "IP Address", wifiIpText());
+  drawStatusRow(250, 180, "Cloud Send", cloudReady() ? "Ready" : "Disabled until Wi-Fi connects", cloudReady() ? COLOR_BLUE : COLOR_SUBTLE);
+}
+
+void updateWifiControlsArea() {
+  clearRect(34, 352, 730, 66, COLOR_PANEL);
+  lcd.setTextColor(COLOR_SUBTLE, COLOR_PANEL);
+  setFontSmall();
+  lcd.setCursor(34, 364);
+  lcd.print(wifiActionMessage);
+  lcd.setCursor(34, 390);
+  lcd.print("Saved SSID: ");
+  lcd.print(savedWifiSsid.length() > 0 ? savedWifiSsid : "None");
+  lcd.setCursor(34, 412);
+  lcd.print("Local dashboard keeps running even with no Wi-Fi.");
+}
+
+void updateWifiPageDynamic() {
+  if (currentPage != PAGE_WIFI) return;
+  lcd.startWrite();
+  updateWifiStatusArea();
+  updateWifiControlsArea();
+  lcd.endWrite();
+}
+
+void drawWifiSelectPage() {
+  lcd.startWrite();
+  lcd.fillScreen(COLOR_BG);
+  drawHeader("Select Network");
+  drawCardBase(16, 84, 768, 342);
+  drawSectionLabel(34, 102, "AVAILABLE NETWORKS");
+  lcd.setTextColor(COLOR_SUBTLE, COLOR_PANEL);
+  setFontSmall();
+  lcd.setCursor(34, 402);
+  lcd.print(wifiActionMessage);
+  lcd.endWrite();
+}
+
+Rect wifiRowRect(int index) {
+  return { 34, 126 + (index * 34), 732, 30 };
+}
+
+void updateWifiListArea(bool forceRedraw) {
+  // Only redraw the scan list when the underlying result set changes.
+  // This avoids repainting the full list area on every touch poll.
+  String nextSig = wifiListSignature();
+  if (!forceRedraw && nextSig == renderedWifiListSignature) return;
+  renderedWifiListSignature = nextSig;
+  clearRect(34, 126, 732, 256, COLOR_PANEL);
+  if (wifiScanInProgress) {
+    lcd.setTextColor(COLOR_TEXT, COLOR_PANEL);
+    setFontMedium();
+    lcd.setCursor(34, 150);
+    lcd.print("Scanning...");
+  } else if (scanNetworkCount == 0) {
+    lcd.setTextColor(COLOR_SUBTLE, COLOR_PANEL);
+    setFontMedium();
+    lcd.setCursor(34, 150);
+    lcd.print("No scanned networks yet");
+  } else {
+    for (int i = 0; i < scanNetworkCount; ++i) {
+      Rect row = wifiRowRect(i);
+      uint16_t fill = (i % 2 == 0) ? COLOR_PANEL : COLOR_PANEL_2;
+      lcd.fillRoundRect(row.x, row.y, row.w, row.h, 8, fill);
+      lcd.setTextColor(COLOR_TEXT, fill);
+      setFontSmall();
+      lcd.setCursor(row.x + 12, row.y + 8);
+      lcd.print(scanSsids[i]);
+      lcd.setTextColor(COLOR_SUBTLE, fill);
+      lcd.setTextDatum(middle_right);
+      lcd.drawString(String(scanRssi[i]) + " dBm", row.x + row.w - 86, row.y + 15);
+      lcd.drawString(scanOpen[i] ? "OPEN" : "SECURED", row.x + row.w - 12, row.y + 15);
+      lcd.setTextDatum(top_left);
+    }
+  }
+}
+
+void updateWifiSelectPageDynamic() {
+  if (currentPage != PAGE_WIFI_SELECT) return;
+  lcd.startWrite();
+  updateWifiListArea(true);
+  lcd.endWrite();
+}
+
+void drawWifiPasswordPage() {
+  lcd.startWrite();
+  lcd.fillScreen(COLOR_BG);
+  drawHeader("Enter Password");
+  drawCardBase(16, 84, 768, 90);
+  drawSectionLabel(34, 102, "NETWORK PASSWORD");
+  drawCardBase(16, 180, 768, 254);
+  drawSectionLabel(34, 198, "KEYBOARD");
+  for (int row = 0; row < KEYBOARD_ROWS; ++row) {
+    for (int col = 0; col < KEYBOARD_COLS; ++col) {
+      Rect r = keyboardKeyRect(row, col);
+      drawButton(r, String(keyboardCharAt(row, col)), COLOR_PANEL_2, COLOR_BORDER);
+    }
+  }
+  drawButton(PASS_BTN_SPACE, "SPACE", COLOR_PANEL_2, COLOR_BORDER);
+  drawButton(PASS_BTN_BKSP, "BKSP", COLOR_PANEL_2, COLOR_BORDER);
+  drawButton(PASS_BTN_CLEAR, "CLEAR", COLOR_PANEL_2, COLOR_BORDER);
+  drawButton(PASS_BTN_CONNECT, "CONNECT", COLOR_BLUE_DIM, COLOR_BLUE);
+  drawButton(PASS_BTN_CANCEL, "CANCEL", COLOR_PANEL_2, COLOR_BORDER);
+  lcd.endWrite();
+}
+
+void updatePasswordField() {
+  // Keep password entry responsive by redrawing only the text field.
+  clearRect(34, 122, 730, 44, COLOR_PANEL);
+  lcd.setTextColor(COLOR_TEXT, COLOR_PANEL);
+  setFontMedium();
+  lcd.setCursor(34, 128);
+  lcd.print(selectedWifiSsid);
+  lcd.setTextColor(COLOR_SUBTLE, COLOR_PANEL);
+  setFontSmall();
+  lcd.setCursor(34, 150);
+  lcd.print(maskedPassword());
+}
+
+void updateWifiKeyboardCharacters() {
+  // Character keys only need repaint when SHIFT changes labels.
+  clearRect(34, 226, 730, 164, COLOR_PANEL);
+  for (int row = 0; row < KEYBOARD_ROWS; ++row) {
+    for (int col = 0; col < KEYBOARD_COLS; ++col) {
+      Rect r = keyboardKeyRect(row, col);
+      drawButton(r, String(keyboardCharAt(row, col)), COLOR_PANEL_2, COLOR_BORDER);
+    }
+  }
+}
+
+void updateKeyboardShiftButton() {
+  drawButton(PASS_BTN_SHIFT, wifiKeyboardShift ? "SHIFT ON" : "SHIFT", wifiKeyboardShift ? COLOR_AMBER : COLOR_PANEL_2, wifiKeyboardShift ? COLOR_AMBER : COLOR_BORDER);
+}
+
+void updateWifiPasswordPageDynamic() {
+  if (currentPage != PAGE_WIFI_PASSWORD) return;
+  lcd.startWrite();
+  updatePasswordField();
+  updateWifiKeyboardCharacters();
+  updateKeyboardShiftButton();
+  lcd.endWrite();
+}
+
+// Full-page renderer:
+// each page has a frame draw plus a matching updater for live values.
+void showCurrentPage() {
+  switch (currentPage) {
+    case PAGE_DASHBOARD: drawDashboardFrame(); updateDashboardData(); break;
+    case PAGE_SETUP: drawSetupPage(); updateSetupPageDynamic(); break;
+    case PAGE_WIFI: drawWifiPage(); updateWifiPageDynamic(); break;
+    case PAGE_WIFI_SELECT: drawWifiSelectPage(); updateWifiSelectPageDynamic(); break;
+    case PAGE_WIFI_PASSWORD: drawWifiPasswordPage(); updateWifiPasswordPageDynamic(); break;
+  }
+}
+
+void setPage(ScreenPage page) {
+  if (currentPage == page) return;
+  currentPage = page;
+  showCurrentPage();
+}
+
+void handleCalibEntryTouch() {
+  if (pointInRect(touchX, touchY, CALIB_KEY_CANCEL)) {
+    closeCalibEntry();
+    return;
+  }
+  if (pointInRect(touchX, touchY, CALIB_KEY_CLEAR)) {
+    calibEntryBuffer = "";
+    lcd.startWrite();
+    updateCalibEntryDisplay();
+    lcd.endWrite();
+    return;
+  }
+  if (pointInRect(touchX, touchY, CALIB_KEY_BKSP)) {
+    if (calibEntryBuffer.length() > 0) {
+      calibEntryBuffer.remove(calibEntryBuffer.length() - 1);
+    }
+    lcd.startWrite();
+    updateCalibEntryDisplay();
+    lcd.endWrite();
+    return;
+  }
+  if (pointInRect(touchX, touchY, CALIB_KEY_APPLY)) {
+    applyCalibEntry();
+    return;
+  }
+
+  for (int row = 0; row < 4; ++row) {
+    for (int col = 0; col < 3; ++col) {
+      Rect r = calibKeyRect(row, col);
+      if (!pointInRect(touchX, touchY, r)) continue;
+
+      char key = calibKeyAt(row, col);
+      if (key == '#') return;
+      if (key == '.' && !calibEntryAllowsDecimal()) return;
+      if (key == '.' && calibEntryBuffer.indexOf('.') >= 0) return;
+      if (calibEntryBuffer.length() >= 10) return;
+
+      calibEntryBuffer += key;
+      lcd.startWrite();
+      updateCalibEntryDisplay();
+      lcd.endWrite();
+      return;
+    }
+  }
+}
+
+// Header buttons are global navigation.
+// Returning true stops the same touch from firing controls on the new page.
+bool handleHeaderNavigation() {
+  if (pointInRect(touchX, touchY, NAV_BTN_1)) {
+    switch (currentPage) {
+      case PAGE_DASHBOARD: setPage(PAGE_SETUP); break;
+      case PAGE_SETUP: setPage(PAGE_DASHBOARD); break;
+      case PAGE_WIFI: setPage(PAGE_DASHBOARD); break;
+      case PAGE_WIFI_SELECT: setPage(PAGE_WIFI); break;
+      case PAGE_WIFI_PASSWORD: setPage(PAGE_WIFI_SELECT); break;
+    }
+    return true;
+  }
+
+  if (pointInRect(touchX, touchY, NAV_BTN_2)) {
+    switch (currentPage) {
+      case PAGE_DASHBOARD: setPage(PAGE_WIFI); break;
+      case PAGE_SETUP: setPage(PAGE_WIFI); break;
+      case PAGE_WIFI: setPage(PAGE_SETUP); break;
+      case PAGE_WIFI_SELECT: setPage(PAGE_DASHBOARD); break;
+      case PAGE_WIFI_PASSWORD: setPage(PAGE_DASHBOARD); break;
+    }
+    return true;
+  }
+  return false;
+}
+
+void handleSetupTouch() {
+  if (activeCalibEntryField != CALIB_ENTRY_NONE) {
+    handleCalibEntryTouch();
+    return;
+  }
+
+  if (pointInRect(touchX, touchY, BTN_CAL_EMPTY)) {
+    triggerSetupButtonHighlight(SETUP_BTN_CAL_EMPTY);
+    issueCalibrationCommand("CAL_EMPTY");
+    lcd.startWrite();
+    updateSetupCommandArea();
+    lcd.endWrite();
+    return;
+  }
+  if (pointInRect(touchX, touchY, BTN_CAL_FULL))  {
+    triggerSetupButtonHighlight(SETUP_BTN_CAL_FULL);
+    issueCalibrationCommand("CAL_FULL");
+    lcd.startWrite();
+    updateSetupCommandArea();
+    lcd.endWrite();
+    return;
+  }
+  if (pointInRect(touchX, touchY, BTN_CLR_CAL))   {
+    triggerSetupButtonHighlight(SETUP_BTN_CLR_CAL);
+    issueCalibrationCommand("CLR_CAL");
+    lcd.startWrite();
+    updateSetupCommandArea();
+    lcd.endWrite();
+    return;
+  }
+  if (pointInRect(touchX, touchY, BTN_GET_CAL))   {
+    triggerSetupButtonHighlight(SETUP_BTN_GET_CAL);
+    issueCalibrationCommand("GET_CAL");
+    lcd.startWrite();
+    updateSetupCommandArea();
+    lcd.endWrite();
+    return;
+  }
+
+  if (pointInRect(touchX, touchY, STEP_TANK_H)) { openCalibEntry(CALIB_ENTRY_TANK_HEIGHT); return; }
+  if (pointInRect(touchX, touchY, STEP_TANK_F)) { openCalibEntry(CALIB_ENTRY_TANK_FULL); return; }
+  if (pointInRect(touchX, touchY, STEP_DOWN_F)) { openCalibEntry(CALIB_ENTRY_DOWN_FT); return; }
+  if (pointInRect(touchX, touchY, STEP_DOWN_I)) { openCalibEntry(CALIB_ENTRY_DOWN_IN); return; }
+
+  if (pointInRect(touchX, touchY, BTN_CALC_BASE)) {
+    refreshCalibrationPreview();
+    calibResultMessage = "Preview updated from current values";
+    lcd.startWrite();
+    updateCalibrationMessages();
+    lcd.endWrite();
+    return;
+  }
+  if (pointInRect(touchX, touchY, BTN_SAVE_BASE)) {
+    runBaselineSaveAction();
+    lcd.startWrite();
+    updateSetupFieldArea();
+    updateCalibrationMessages();
+    lcd.endWrite();
+    return;
+  }
+  if (pointInRect(touchX, touchY, BTN_TOGGLE_OVR)) {
+    toggleBaselineOverride();
+    lcd.startWrite();
+    updateSetupFieldArea();
+    updateCalibrationMessages();
+    lcd.endWrite();
+    return;
+  }
+}
+
+void handleWifiTouch() {
+  if (pointInRect(touchX, touchY, BTN_WIFI_SCAN)) {
+    beginWifiScan();
+    setPage(PAGE_WIFI_SELECT);
+    return;
+  }
+  if (pointInRect(touchX, touchY, BTN_WIFI_RECONNECT)) {
+    startWiFiConnection(savedWifiSsid, savedWifiPassword);
+    lcd.startWrite();
+    updateWifiStatusArea();
+    updateWifiControlsArea();
+    lcd.endWrite();
+    return;
+  }
+  if (pointInRect(touchX, touchY, BTN_WIFI_FORGET)) {
+    forgetWifiAction();
+    lcd.startWrite();
+    updateWifiStatusArea();
+    updateWifiControlsArea();
+    lcd.endWrite();
+    return;
+  }
+}
+
+void handleWifiSelectTouch() {
+  if (wifiScanInProgress) return;
+  for (int i = 0; i < scanNetworkCount; ++i) {
+    if (pointInRect(touchX, touchY, wifiRowRect(i))) {
+      selectedWifiSsid = scanSsids[i];
+      wifiPasswordEntry = "";
+      wifiKeyboardShift = false;
+      setPage(PAGE_WIFI_PASSWORD);
+      return;
+    }
+  }
+}
+
+void handleWifiPasswordTouch() {
+  if (pointInRect(touchX, touchY, PASS_BTN_SHIFT)) {
+    wifiKeyboardShift = !wifiKeyboardShift;
+    lcd.startWrite();
+    updateKeyboardShiftButton();
+    updateWifiKeyboardCharacters();
+    lcd.endWrite();
+    return;
+  }
+  if (pointInRect(touchX, touchY, PASS_BTN_SPACE)) {
+    wifiPasswordEntry += ' ';
+    lcd.startWrite();
+    updatePasswordField();
+    lcd.endWrite();
+    return;
+  }
+  if (pointInRect(touchX, touchY, PASS_BTN_BKSP)) {
+    if (wifiPasswordEntry.length() > 0) wifiPasswordEntry.remove(wifiPasswordEntry.length() - 1);
+    lcd.startWrite();
+    updatePasswordField();
+    lcd.endWrite();
+    return;
+  }
+  if (pointInRect(touchX, touchY, PASS_BTN_CLEAR)) {
+    wifiPasswordEntry = "";
+    lcd.startWrite();
+    updatePasswordField();
+    lcd.endWrite();
+    return;
+  }
+  if (pointInRect(touchX, touchY, PASS_BTN_CANCEL)) {
+    setPage(PAGE_WIFI_SELECT);
+    return;
+  }
+  if (pointInRect(touchX, touchY, PASS_BTN_CONNECT)) {
+    saveWiFiCredentials(selectedWifiSsid, wifiPasswordEntry);
+    startWiFiConnection(selectedWifiSsid, wifiPasswordEntry);
+    setPage(PAGE_WIFI);
+    return;
+  }
+
+  for (int row = 0; row < KEYBOARD_ROWS; ++row) {
+    for (int col = 0; col < KEYBOARD_COLS; ++col) {
+      Rect r = keyboardKeyRect(row, col);
+      if (pointInRect(touchX, touchY, r)) {
+        if (wifiPasswordEntry.length() < 63) wifiPasswordEntry += keyboardCharAt(row, col);
+        lcd.startWrite();
+        updatePasswordField();
+        lcd.endWrite();
+        return;
+      }
+    }
+  }
+}
+
+void handleTouchPress() {
+  if (currentPage == PAGE_SETUP && activeCalibEntryField != CALIB_ENTRY_NONE) {
+    handleCalibEntryTouch();
+    return;
+  }
+  if (handleHeaderNavigation()) return;
+  switch (currentPage) {
+    case PAGE_DASHBOARD: break;
+    case PAGE_SETUP: handleSetupTouch(); break;
+    case PAGE_WIFI: handleWifiTouch(); break;
+    case PAGE_WIFI_SELECT: handleWifiSelectTouch(); break;
+    case PAGE_WIFI_PASSWORD: handleWifiPasswordTouch(); break;
+  }
+}
+
+// Touch actions fire on the initial press only, which prevents held touches
+// from repeatedly activating the same control.
+void handleTouchInput() {
+  unsigned long now = millis();
+  // Poll touch at a fixed cadence instead of every loop iteration.
+  // This reduces I2C/display contention that can show up as tiny visual jitter.
+  if (now - lastTouchPollMillis < TOUCH_POLL_INTERVAL_MS) {
+    return;
+  }
+  lastTouchPollMillis = now;
+
+  uint16_t x = 0;
+  uint16_t y = 0;
+  bool touched = touchAvailable && lcd.getTouch(&x, &y);
+  if (touched) {
+    touchX = x;
+    touchY = y;
+  }
+  bool justPressed = touched && !touchPressed;
+  touchPressed = touched;
+  if (justPressed && (now - lastTouchActionMillis >= TOUCH_DEBOUNCE_MS)) {
+    lastTouchActionMillis = now;
+    handleTouchPress();
+  }
+}
+
+// Wi-Fi is optional and non-blocking:
+// scans run asynchronously and connection progress is polled from loop().
+void updateWifiStateMachine() {
+  unsigned long now = millis();
+  if (now - lastWifiRefresh < WIFI_STATUS_REFRESH_MS) return;
+  lastWifiRefresh = now;
+
+  if (wifiScanInProgress) {
+    int result = WiFi.scanComplete();
+    if (result >= 0) {
+      collectScanResults(result);
+      if (currentPage == PAGE_WIFI_SELECT) {
+        lcd.startWrite();
+        updateWifiListArea(false);
+        lcd.endWrite();
+      }
+    } else if (result == WIFI_SCAN_FAILED) {
+      wifiScanInProgress = false;
+      wifiActionMessage = "Network scan failed";
+    }
+  }
+
+  wl_status_t status = WiFi.status();
+  if (status == WL_CONNECTED) {
+    wifiConnectInProgress = false;
+    wifiActionMessage = "Connected to " + WiFi.SSID();
+  } else if (wifiConnectInProgress && status == WL_CONNECT_FAILED) {
+    wifiConnectInProgress = false;
+    wifiActionMessage = "Connection failed";
+  } else if (!wifiConnectInProgress && savedWifiSsid.length() == 0) {
+    wifiActionMessage = "No saved Wi-Fi credentials";
+  }
+
+  String nextSummary = wifiSummaryLine();
+  if (nextSummary != cachedWifiStateLine) {
+    cachedWifiStateLine = nextSummary;
+    if (currentPage == PAGE_WIFI) {
+      lcd.startWrite();
+      updateWifiStatusArea();
+      updateWifiControlsArea();
+      lcd.endWrite();
+    } else if (currentPage == PAGE_WIFI_SELECT) {
+      lcd.startWrite();
+      updateWifiListArea(false);
+      lcd.endWrite();
+    }
+  }
+}
+
+void setup() {
+  pinMode(PIN_BACKLIGHT, OUTPUT);
+  digitalWrite(PIN_BACKLIGHT, HIGH);
+  Serial.begin(115200);
+  // Keep HC-12 on a dedicated UART so boot/debug traffic on UART0 does not
+  // get transmitted over the radio and show up as ERR UNKNOWN_CMD.
+  HC12Serial.begin(9600, SERIAL_8N1, HC12_RX_PIN, HC12_TX_PIN);
+
+  prefs.begin("cistern", false);
+  loadCalibrationSettings();
+  loadWiFiCredentials();
+  refreshCalibrationPreview();
+
+  Wire.begin(TOUCH_SDA_PIN, TOUCH_SCL_PIN, TOUCH_I2C_FREQ);
+  touchAddress = detectGT911Address();
+  touchAvailable = (touchAddress != 0);
+  if (touchAvailable) lcd.configureTouch(touchAddress);
+
+  lcd.init();
+  lcd.setRotation(0);
+  lcd.setTextWrap(false);
+
+  if (savedWifiSsid.length() > 0) startWiFiConnection(savedWifiSsid, savedWifiPassword);
+  else wifiActionMessage = "No saved Wi-Fi credentials";
+
+  showCurrentPage();
+
+  Serial.println("Ready for HC-12 data");
+  if (touchAvailable) {
+    Serial.print("GT911 touch detected at I2C address 0x");
+    Serial.println(touchAddress, HEX);
+  } else {
+    Serial.println("GT911 touch not detected on 0x5D or 0x14");
+  }
+}
+
+void loop() {
+  unsigned long now = millis();
+
+  while (HC12Serial.available()) {
+    char c = (char)HC12Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (rxLine.length() > 0) {
+        lastRaw = rxLine;
+        Serial.print("Received: ");
+        Serial.println(lastRaw);
+        if (parsePacket(lastRaw)) {
+          hasValidPacket = true;
+          lastPacketMillis = now;
+          postCisternReading();
+          if (currentPage == PAGE_DASHBOARD) updateDashboardData();
+          else if (currentPage == PAGE_SETUP) {
+            lcd.startWrite();
+            updateSetupLiveSnapshot();
+            lcd.endWrite();
+          }
+        } else {
+          // Non-packet lines are typically command acknowledgements from the PCB.
+          calibCommandResult = lastRaw;
+          if (bridgeCommandPending) {
+            postCommandResultToServer(bridgePendingCommandId, bridgePendingCommand, lastRaw, true);
+            bridgeCommandPending = false;
+            bridgePendingCommandId = "";
+            bridgePendingCommand = "";
+            bridgePendingCommandMillis = 0;
+          }
+          if (currentPage == PAGE_SETUP) {
+            lcd.startWrite();
+            updateSetupCommandArea();
+            lcd.endWrite();
+          }
+        }
+        rxLine = "";
+      }
+    } else {
+      rxLine += c;
+      if (rxLine.length() > 140) rxLine.remove(140);
+    }
+  }
+
+  if (currentPage == PAGE_DASHBOARD && now - lastFooterRefresh >= FOOTER_REFRESH_MS) {
+    lastFooterRefresh = now;
+    String nextFooter = footerLineText();
+    String nextHeader = headerStatusText();
+    if (nextFooter != cachedFooterLine || nextHeader != cachedHeaderStatus) {
+      lcd.startWrite();
+      if (nextFooter != cachedFooterLine) updateFooterDynamic();
+      if (nextHeader != cachedHeaderStatus) drawHeaderStatusPill();
+      lcd.endWrite();
+    }
+  }
+
+  if (currentPage == PAGE_SETUP && highlightedSetupButton != SETUP_BTN_NONE && now >= setupButtonHighlightUntil) {
+    highlightedSetupButton = SETUP_BTN_NONE;
+    lcd.startWrite();
+    updateSetupCommandArea();
+    lcd.endWrite();
+  }
+
+  if (bridgeCommandPending && now - bridgePendingCommandMillis >= SERVER_COMMAND_RESULT_TIMEOUT_MS) {
+    postCommandResultToServer(bridgePendingCommandId, bridgePendingCommand, "TIMEOUT waiting for HC-12 reply", false);
+    bridgeCommandPending = false;
+    bridgePendingCommandId = "";
+    bridgePendingCommand = "";
+    bridgePendingCommandMillis = 0;
+  }
+
+  updateWifiStateMachine();
+  pollServerForCommand();
+  handleTouchInput();
+}
