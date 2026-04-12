@@ -18,7 +18,9 @@ SERIAL_PORT = os.environ.get("SERIAL_PORT", "COM4")
 SERIAL_BAUD = int(os.environ.get("SERIAL_BAUD", "115200"))
 DB_PATH = os.environ.get("DB_PATH", "cistern.db")
 ENABLE_SERIAL_WORKER = env_flag("ENABLE_SERIAL_WORKER", "1")
-UI2_BUILD_DIR = os.path.join(os.path.dirname(__file__), "Cistern_UI", "src", "build")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+UI2_BUILD_DIR = os.path.join(BASE_DIR, "Cistern_UI", "src", "build")
 
 # ---------------- DB ----------------
 def db_init():
