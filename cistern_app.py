@@ -4,9 +4,11 @@ import os
 import uuid
 import threading, time, sqlite3
 from datetime import datetime, date, timedelta
-from flask import Flask, render_template_string, jsonify, request, send_from_directory, Response
+from functools import wraps
+from flask import Flask, render_template_string, jsonify, request, send_from_directory, Response, redirect, session, url_for
 import serial
 import math
+from werkzeug.security import check_password_hash
 
 def env_flag(name, default="0"):
     v = os.environ.get(name, default)
@@ -18,9 +20,11 @@ SERIAL_PORT = os.environ.get("SERIAL_PORT", "COM4")
 SERIAL_BAUD = int(os.environ.get("SERIAL_BAUD", "115200"))
 DB_PATH = os.environ.get("DB_PATH", "cistern.db")
 ENABLE_SERIAL_WORKER = env_flag("ENABLE_SERIAL_WORKER", "1")
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-UI2_BUILD_DIR = os.path.join(BASE_DIR, "Cistern_UI", "src", "build")
+UI2_BUILD_DIR = os.path.join(os.path.dirname(__file__), "Cistern_UI", "build")
+ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "")
+ADMIN_PASSWORD_HASH = os.environ.get("ADMIN_PASSWORD_HASH", "")
+DEVICE_API_TOKEN = os.environ.get("DEVICE_API_TOKEN", "")
+SECRET_KEY = os.environ.get("SECRET_KEY", "dev-secret-key-change-me")
 
 # ---------------- DB ----------------
 def db_init():
@@ -629,6 +633,62 @@ def serial_worker():
 
 # ---------------- Flask ----------------
 app = Flask(__name__)
+app.secret_key = SECRET_KEY
+
+LOGIN_PAGE = """<!doctype html><html><head><meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Cistern Login</title>
+<style>
+body{font-family:Arial;margin:0;background:#f5f7fb;color:#222}
+.wrap{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px}
+.card{width:100%;max-width:360px;background:#fff;border:1px solid #dfe3ea;border-radius:14px;padding:22px;box-shadow:0 10px 30px rgba(0,0,0,.06)}
+h1{font-size:24px;margin:0 0 6px}
+p{margin:0 0 18px;color:#666}
+label{display:block;font-size:13px;margin:12px 0 6px}
+input{width:100%;box-sizing:border-box;padding:11px 12px;border:1px solid #cfd6e0;border-radius:10px}
+button{width:100%;margin-top:16px;padding:11px 14px;border:0;border-radius:10px;background:#2563eb;color:#fff;font-weight:700;cursor:pointer}
+.err{margin:0 0 12px;padding:10px 12px;border-radius:10px;background:#fff2f2;color:#a11;border:1px solid #f2c4c4}
+</style></head><body>
+<div class="wrap">
+  <form class="card" method="post">
+    <h1>Cistern Login</h1>
+    <p>Sign in to access the dashboard and control routes.</p>
+    __ERROR_HTML__
+    <label>Username</label>
+    <input type="text" name="username" autocomplete="username" required />
+    <label>Password</label>
+    <input type="password" name="password" autocomplete="current-password" required />
+    <button type="submit">Log In</button>
+  </form>
+</div>
+</body></html>"""
+
+def is_logged_in():
+    return bool(session.get("logged_in"))
+
+def login_required(view_func):
+    # Human users use a browser session to reach the dashboard and admin APIs.
+    @wraps(view_func)
+    def wrapped(*args, **kwargs):
+        if is_logged_in():
+            return view_func(*args, **kwargs)
+        if request.path.startswith("/api/"):
+            return jsonify({"ok": False, "msg": "Authentication required"}), 401
+        return redirect(url_for("login", next=request.path))
+    return wrapped
+
+def device_token_required(view_func):
+    # Devices do not use browser sessions. They authenticate with X-Device-Token
+    # so the ESP32 can push readings and poll command state automatically.
+    @wraps(view_func)
+    def wrapped(*args, **kwargs):
+        if not DEVICE_API_TOKEN:
+            return jsonify({"ok": False, "msg": "DEVICE_API_TOKEN is not configured"}), 500
+        token = request.headers.get("X-Device-Token", "")
+        if token != DEVICE_API_TOKEN:
+            return jsonify({"ok": False, "msg": "Unauthorized device"}), 401
+        return view_func(*args, **kwargs)
+    return wrapped
 
 PAGE = """<!doctype html><html><head><meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
@@ -1031,16 +1091,46 @@ async function refresh(){
 </script></body></html>
 """
 
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    error_html = ""
+
+    if request.method == "POST":
+        if not ADMIN_USERNAME or not ADMIN_PASSWORD_HASH:
+            error_html = '<div class="err">Server auth is not configured yet.</div>'
+        else:
+            username = (request.form.get("username") or "").strip()
+            password = request.form.get("password") or ""
+            if username == ADMIN_USERNAME and check_password_hash(ADMIN_PASSWORD_HASH, password):
+                session.clear()
+                session["logged_in"] = True
+                session["username"] = username
+                next_url = request.args.get("next") or url_for("home")
+                return redirect(next_url)
+            error_html = '<div class="err">Invalid username or password.</div>'
+
+    return render_template_string(LOGIN_PAGE.replace("__ERROR_HTML__", error_html))
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
+
 @app.route("/")
+@login_required
 def home():
     return render_template_string(PAGE)
 
 # -------- Settings APIs --------
+# Admin-only routes below use session login because they back the human dashboard
+# and control/configuration workflows.
 @app.route("/api/settings")
+@login_required
 def api_settings():
     return jsonify(load_settings())
 
 @app.route("/api/settings", methods=["POST"])
+@login_required
 def api_settings_save():
     data = request.get_json(silent=True) or {}
 
@@ -1080,6 +1170,7 @@ def api_settings_save():
     })
 
 @app.route("/api/baseline_set", methods=["POST"])
+@login_required
 def api_baseline_set():
     data = request.get_json(silent=True) or {}
 
@@ -1099,6 +1190,7 @@ def api_baseline_set():
     return jsonify({"baseline_pct": pct, "baseline_ts": ts})
 
 @app.route("/api/usage/recompute_day", methods=["POST"])
+@login_required
 def api_usage_recompute_day():
     data = request.get_json(silent=True) or {}
     day = (data.get("day") or "").strip()
@@ -1115,6 +1207,7 @@ def api_usage_recompute_day():
 
 
 @app.route("/api/baseline/toggle", methods=["POST"])
+@login_required
 def api_baseline_toggle():
     data = request.get_json(silent=True) or {}
     enable = 1 if bool(data.get("enable", False)) else 0
@@ -1122,6 +1215,7 @@ def api_baseline_toggle():
     return jsonify({"force_baseline": enable})
 
 @app.route("/api/haul/settings_set", methods=["POST"])
+@login_required
 def api_haul_settings_set():
     data = request.get_json(silent=True) or {}
     haul_tank_gal = float(data.get("haul_tank_gal", 600))
@@ -1139,19 +1233,24 @@ def api_haul_settings_set():
 
 # -------- Status + readings APIs --------
 @app.route("/api/status")
+@login_required
 def api_status():
     return jsonify(current_status_payload())
 
 @app.route("/api/recent")
+@login_required
 def api_recent():
     out=[]
     for (ts,lvl,gal,adc,cal,pkt) in db_recent(25):
         out.append({"ts":ts,"lvl_pct":lvl,"gal_imp":gal,"adc":adc,"cal":cal,"packet":pkt})
     return jsonify(out)
 
+# Device-facing routes stay outside browser session auth. They use X-Device-Token
+# so the ESP32 can push readings and poll command state from anywhere.
 # This lets the ESP32 screen replace the Nano bridge as a network uplink
 # while keeping the existing serial_worker path available for fallback/testing.
 @app.route("/api/device/update", methods=["POST"])
+@device_token_required
 def api_device_update():
     global latest
 
@@ -1197,6 +1296,7 @@ def api_device_update():
     return jsonify({"ok": True, "source": "wifi", "ts": ts})
 
 @app.route("/api/device/command", methods=["GET"])
+@device_token_required
 def api_device_command():
     device_id = (request.args.get("device_id") or BRIDGE_DEVICE_ID).strip() or BRIDGE_DEVICE_ID
     mark_bridge_seen(device_id)
@@ -1229,6 +1329,7 @@ def api_device_command():
     return jsonify({"ok": True, "pending": False})
 
 @app.route("/api/device/command_result", methods=["POST"])
+@device_token_required
 def api_device_command_result():
     global cmd_state
 
@@ -1267,6 +1368,7 @@ def api_device_command_result():
 
 # -------- Serial command APIs --------
 @app.route("/api/send_cmd", methods=["POST"])
+@login_required
 def api_send_cmd():
     data = request.get_json(silent=True) or {}
     cmd = (data.get("cmd") or "").strip()
@@ -1274,6 +1376,7 @@ def api_send_cmd():
     return jsonify({"result": result})
 
 @app.route("/api/cmd_status")
+@login_required
 def api_cmd_status():
     queued = 0
     in_flight = 0
@@ -1293,18 +1396,22 @@ def api_cmd_status():
     })
 
 @app.route("/api/calibration/empty", methods=["POST"])
+@login_required
 def api_calibration_empty():
     return jsonify({"result": send_command("CAL_EMPTY")})
 
 @app.route("/api/calibration/full", methods=["POST"])
+@login_required
 def api_calibration_full():
     return jsonify({"result": send_command("CAL_FULL")})
 
 @app.route("/api/calibration/clear", methods=["POST"])
+@login_required
 def api_calibration_clear():
     return jsonify({"result": send_command("CLR_CAL")})
 
 @app.route("/api/calibration/manual", methods=["POST"])
+@login_required
 def api_calibration_manual():
     data = request.get_json(silent=True) or {}
     down_inches = max(0.0, float(data.get("down_inches", 0)))
@@ -1329,14 +1436,17 @@ def api_calibration_manual():
     })
 
 @app.route("/api/capture_live", methods=["POST"])
+@login_required
 def api_capture_live():
     return jsonify({"ok": True, "status": current_status_payload()})
 
 @app.route("/api/export_logs", methods=["POST"])
+@login_required
 def api_export_logs():
     return jsonify({"ok": True, "download_url": "/api/export_logs.csv"})
 
 @app.route("/api/export_logs.csv")
+@login_required
 def api_export_logs_csv():
     output = io.StringIO()
     writer = csv.writer(output)
@@ -1351,6 +1461,7 @@ def api_export_logs_csv():
 
 # -------- Level 3: Usage APIs --------
 @app.route("/api/usage/recompute_today", methods=["POST"])
+@login_required
 def api_usage_recompute_today():
     day = today_str()
     res = compute_usage_for_day(day)
@@ -1361,6 +1472,7 @@ def api_usage_recompute_today():
     return jsonify({"ok": True, "day": day, "gal_used": used, "samples": samples})
 
 @app.route("/api/usage/summary")
+@login_required
 def api_usage_summary():
     rows = db_usage_recent(30)
     vals = [float(r[1]) for r in rows if r[1] is not None and float(r[1]) >= 0]
@@ -1386,6 +1498,7 @@ def api_usage_summary():
     })
 
 @app.route("/api/ui2/history")
+@login_required
 def api_ui2_history():
     days = max(1, min(365, int(request.args.get("days", 30))))
     usage_rows = db_usage_recent(days)
@@ -1398,6 +1511,7 @@ def api_ui2_history():
 
 # -------- Level 3: Fill event APIs --------
 @app.route("/api/fill/log", methods=["POST"])
+@login_required
 def api_fill_log():
     data = request.get_json(silent=True) or {}
     kind = (data.get("kind") or "").strip()
@@ -1416,6 +1530,7 @@ def api_fill_log():
     return jsonify({"ok": True})
 
 @app.route("/api/fill/recent")
+@login_required
 def api_fill_recent():
     rows = db_fill_events_recent(20)
     out = [{"ts": ts, "kind": k, "gallons_added": g, "note": n} for (ts, k, g, n) in rows]
@@ -1423,6 +1538,7 @@ def api_fill_recent():
 
 # -------- Level 3: Hauling plan API --------
 @app.route("/api/haul/plan")
+@login_required
 def api_haul_plan():
     settings = load_settings()
     avg_daily = usage_avg_daily(30)
@@ -1492,6 +1608,7 @@ def api_haul_plan():
 @app.route("/ui2")
 @app.route("/ui2/")
 @app.route("/ui2/<path:path>")
+@login_required
 def ui2(path="index.html"):
     if not os.path.isdir(UI2_BUILD_DIR):
         return (
@@ -1521,4 +1638,3 @@ if __name__ == "__main__":
     create_app()
     start_background_workers()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8085")), debug=False)
-
